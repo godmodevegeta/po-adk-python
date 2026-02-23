@@ -19,7 +19,7 @@ from .tools import (
 
 root_agent = Agent(
     name="healthcare_fhir_agent",
-    model="gemini-2.0-flash",
+    model="gemini-2.5-flash",
     description=(
         "A clinical assistant that queries a patient's FHIR health record "
         "to answer questions about demographics, medications, conditions, and observations."

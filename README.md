@@ -127,7 +127,11 @@ pip install -r requirements.txt
 ### 3 — Configure environment variables
 
 ```bash
+# macOS / Linux
 cp .env.example .env
+
+# Windows (Command Prompt)
+copy .env.example .env
 ```
 
 Open `.env` and set your Google API key:
