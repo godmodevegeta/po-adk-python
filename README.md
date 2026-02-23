@@ -22,6 +22,8 @@ This is not a single-file template. It is a **monorepo with three working agents
 - [Configuration reference](#configuration-reference)
 - [API security](#api-security)
 - [Testing locally](#testing-locally)
+- [Running with Docker (local)](#running-with-docker-local)
+- [Deploying to Google Cloud Run](#deploying-to-google-cloud-run)
 - [Connecting to Prompt Opinion](#connecting-to-prompt-opinion)
 
 ---
@@ -157,6 +159,25 @@ uvicorn general_agent.app:a2a_app --host 0.0.0.0 --port 8002
 # Terminal 3 — Orchestrator (delegates to agents 1 & 2)
 uvicorn orchestrator.app:a2a_app --host 0.0.0.0 --port 8003
 ```
+
+---
+
+**Option C — Docker Compose (no Python install required)**
+
+If you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed, you can run all three agents in containers without setting up a Python virtual environment at all.
+
+```bash
+# First run: build the image and start all three agents
+docker compose up --build
+
+# Subsequent runs (image already built)
+docker compose up
+
+# Stop all agents
+docker compose down
+```
+
+Agents are available on the same ports as the bare-Python option — `localhost:8001`, `localhost:8002`, `localhost:8003`. See [Running with Docker (local)](#running-with-docker-local) for more detail.
 
 ### 5 — Verify an agent is running
 
@@ -456,6 +477,267 @@ bash scripts/test_fhir_hook.sh
 | D | Valid key + FHIR context — clinical summary | `hook_called_fhir_found` |
 | D2 | Valid key + FHIR context — vital signs | `tool_get_recent_observations` |
 | E | Valid key + malformed FHIR value | `hook_called_fhir_malformed` |
+
+---
+
+## Running with Docker (local)
+
+Docker lets you run the agents in containers on your local machine — no Python, no virtual environment, no `pip install`. You only need [Docker Desktop](https://www.docker.com/products/docker-desktop/).
+
+This is also useful for testing the exact same image that will run in Google Cloud Run before you deploy.
+
+### How the three tiers relate
+
+```
+Your machine (Option B)          Your machine (Option C)          Google Cloud Run
+──────────────────────           ──────────────────────           ────────────────
+Python venv + honcho             Docker Desktop                   Google's servers
+    honcho start             →   docker compose up           →    gcloud run deploy
+                                       ↕                                 ↕
+                                same Dockerfile             same Dockerfile
+```
+
+All three options use the **same code and the same `Dockerfile`**. Docker and Cloud Run are not separate things — Cloud Run is just "Docker hosted by Google."
+
+> **Only run one option at a time.** Docker (Option C) and honcho/uvicorn (Option B) all listen on the same ports — 8001, 8002, and 8003. If both are running simultaneously, the second one will crash with `address already in use`. Always stop one before starting the other.
+
+---
+
+### Start all three agents with Docker Compose
+
+```bash
+# First run — builds the image then starts all three agents
+docker compose up --build
+
+# Subsequent runs — image is already cached, starts immediately
+docker compose up
+```
+
+| Agent | Local URL |
+|---|---|
+| `healthcare_agent` | http://localhost:8001 |
+| `general_agent` | http://localhost:8002 |
+| `orchestrator` | http://localhost:8003 |
+
+> **Seeing logs in your terminal? That's correct.** `docker compose up` streams container output to the terminal you ran it from. The agents are running inside Docker — your terminal is just a live log viewer. To verify, open a second terminal and run `docker ps`; you should see three running containers. If you'd rather Docker run silently in the background, use `docker compose up -d` instead (see below).
+
+**Stop the agents:**
+
+```bash
+docker compose down
+```
+
+> **Ctrl+C vs `docker compose down`:** If you started with `docker compose up` (attached), Ctrl+C stops the containers and frees the ports — but `docker compose down` is cleaner as it also removes the containers fully. If you started with `docker compose up -d` (background), Ctrl+C does nothing; you must run `docker compose down` to stop them.
+
+**Run in the background (no log output in terminal):**
+
+```bash
+docker compose up -d             # start silently
+docker compose logs -f           # view logs on demand (Ctrl+C to stop following)
+docker compose logs -f healthcare # view one agent's logs only
+```
+
+**Rebuild after changing code:**
+
+```bash
+docker compose up --build
+```
+
+**Run a single agent only (e.g. for testing just `general_agent`):**
+
+```bash
+docker compose up general
+```
+
+---
+
+### Run a single agent manually with plain Docker
+
+```bash
+# Build the image once
+docker build -t adk-agents .
+
+# Start the general_agent on port 8002
+docker run --rm -p 8002:8002 \
+  -e AGENT_MODULE=general_agent.app:a2a_app \
+  -e PORT=8002 \
+  -e GOOGLE_API_KEY=your-key-here \
+  -e GOOGLE_GENAI_USE_VERTEXAI=FALSE \
+  adk-agents
+```
+
+Change `AGENT_MODULE` and `-p` to start a different agent.
+
+---
+
+## Deploying to Google Cloud Run
+
+Cloud Run is the recommended way to publish these agents with a permanent public HTTPS URL. Each agent runs as its own managed service. The [Cloud Run free tier](https://cloud.google.com/run/pricing#tables) includes:
+
+| Resource | Free per month |
+|---|---|
+| Requests | 2,000,000 |
+| Compute (memory) | 360,000 GB-seconds |
+| Compute (CPU) | 180,000 vCPU-seconds |
+
+This is more than enough for development and light production use. **Gemini model calls are billed through the AI Studio API** — using `GOOGLE_GENAI_USE_VERTEXAI=FALSE` (the default in `.env.example`) keeps you on the AI Studio free quota and avoids Vertex AI charges entirely.
+
+> **Avoid Agent Engine.** Google ADK also offers "Agent Engine" (Vertex AI Managed Agents), which is a paid service with no free tier. The `gcloud run deploy` approach used here deploys to standard Cloud Run, which has the free tier above.
+
+---
+
+### Prerequisites
+
+- A [Google Cloud account](https://cloud.google.com/free) (a billing account is required for account verification, but the free tier means no charges for normal dev usage)
+- [Google Cloud CLI (`gcloud`)](https://cloud.google.com/sdk/docs/install) installed
+- A GCP project (create one at [console.cloud.google.com](https://console.cloud.google.com))
+
+---
+
+### Step 1 — One-time GCP setup
+
+**Authenticate and point `gcloud` at your project:**
+
+```bash
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+```
+
+**Enable the required APIs** (takes ~1 minute, run once per project):
+
+```bash
+gcloud services enable \
+  run.googleapis.com \
+  cloudbuild.googleapis.com \
+  artifactregistry.googleapis.com \
+  secretmanager.googleapis.com
+```
+
+**Store your Google API key in Secret Manager** (keeps it out of deployment logs and the Cloud Console UI):
+
+```bash
+echo -n "your-google-api-key-here" | \
+  gcloud secrets create google-api-key --data-file=-
+```
+
+---
+
+### Step 2 — Deploy each agent
+
+All three agents are built from the **same `Dockerfile`** at the root of the repo. The `AGENT_MODULE` environment variable tells the container which agent to start — so each Cloud Run service is just a separate deployment of the same image with a different value.
+
+**Deploy `healthcare_agent`** (authenticated, FHIR-connected):
+
+```bash
+gcloud run deploy healthcare-agent \
+  --source . \
+  --region us-central1 \
+  --set-env-vars "AGENT_MODULE=healthcare_agent.app:a2a_app,GOOGLE_GENAI_USE_VERTEXAI=FALSE" \
+  --set-secrets "GOOGLE_API_KEY=google-api-key:latest" \
+  --allow-unauthenticated \
+  --min-instances 0 \
+  --max-instances 3
+```
+
+**Deploy `general_agent`** (public, no API key needed):
+
+```bash
+gcloud run deploy general-agent \
+  --source . \
+  --region us-central1 \
+  --set-env-vars "AGENT_MODULE=general_agent.app:a2a_app,GOOGLE_GENAI_USE_VERTEXAI=FALSE" \
+  --set-secrets "GOOGLE_API_KEY=google-api-key:latest" \
+  --allow-unauthenticated \
+  --min-instances 0 \
+  --max-instances 3
+```
+
+**Deploy `orchestrator`** (authenticated, delegates to both sub-agents in-process):
+
+```bash
+gcloud run deploy orchestrator \
+  --source . \
+  --region us-central1 \
+  --set-env-vars "AGENT_MODULE=orchestrator.app:a2a_app,GOOGLE_GENAI_USE_VERTEXAI=FALSE" \
+  --set-secrets "GOOGLE_API_KEY=google-api-key:latest" \
+  --allow-unauthenticated \
+  --min-instances 0 \
+  --max-instances 3
+```
+
+After each deploy, `gcloud` prints the service URL — save all three:
+
+```
+Service URL: https://healthcare-agent-abc123-uc.a.run.app
+Service URL: https://general-agent-abc123-uc.a.run.app
+Service URL: https://orchestrator-abc123-uc.a.run.app
+```
+
+> **Note on `--allow-unauthenticated`:** This disables Cloud Run's IAM layer so requests can reach the agent without a Google identity. Application-level security (the `X-API-Key` header) is still enforced by `ApiKeyMiddleware` for the agents that require it. The `general_agent` is intentionally open.
+
+---
+
+### Step 3 — Set public URLs on each service
+
+The agent card advertises the agent's own public URL so callers (including Prompt Opinion) know where to send requests. After deploying, update each service with its real Cloud Run URL:
+
+```bash
+# Replace the URLs below with the ones printed by gcloud in Step 2
+HEALTHCARE_URL=https://healthcare-agent-abc123-uc.a.run.app
+GENERAL_URL=https://general-agent-abc123-uc.a.run.app
+ORCHESTRATOR_URL=https://orchestrator-abc123-uc.a.run.app
+
+gcloud run services update healthcare-agent \
+  --region us-central1 \
+  --update-env-vars "HEALTHCARE_AGENT_URL=${HEALTHCARE_URL}"
+
+gcloud run services update general-agent \
+  --region us-central1 \
+  --update-env-vars "GENERAL_AGENT_URL=${GENERAL_URL}"
+
+gcloud run services update orchestrator \
+  --region us-central1 \
+  --update-env-vars "ORCHESTRATOR_URL=${ORCHESTRATOR_URL}"
+```
+
+> **Why the orchestrator doesn't need the other URLs:** Sub-agents run **in-process** via `AgentTool` — no HTTP calls are made from the orchestrator to the other Cloud Run services. `ORCHESTRATOR_URL` is only used for the agent card.
+
+---
+
+### Step 4 — Verify the deployments
+
+```bash
+# Check the agent card for each service
+curl https://healthcare-agent-abc123-uc.a.run.app/.well-known/agent-card.json
+curl https://general-agent-abc123-uc.a.run.app/.well-known/agent-card.json
+curl https://orchestrator-abc123-uc.a.run.app/.well-known/agent-card.json
+
+# Call the public general_agent (no key needed)
+curl -X POST https://general-agent-abc123-uc.a.run.app/ \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user","parts":[{"kind":"text","text":"What is the ICD-10 code for hypertension?"}]}}}'
+```
+
+---
+
+### Free tier tips
+
+| Setting | Why it matters |
+|---|---|
+| `GOOGLE_GENAI_USE_VERTEXAI=FALSE` | Uses AI Studio API key — Gemini free quota. Vertex AI is billed from the first call. |
+| `--min-instances 0` | Container scales to zero when idle — no compute charge while no requests arrive. |
+| `--max-instances 3` | Caps concurrency during development so you don't accidentally burn compute. |
+| `--region us-central1` | Cloud Run free tier applies to this region; not all regions qualify. |
+
+> **Cold starts:** With `--min-instances 0`, the first request after a period of inactivity takes a few extra seconds while the container boots. This is fine for development. Set `--min-instances 1` to keep a container warm at all times (approximately $5/month on Cloud Run sustained-use pricing).
+
+---
+
+### Why not `adk deploy cloud_run`?
+
+Google ADK ships an `adk deploy cloud_run` command designed for agents served through the ADK web UI (`adk web`). It wraps the agent using ADK's built-in FastAPI server, not the A2A `to_a2a()` ASGI server that this repo uses.
+
+Because these agents expose the A2A JSON-RPC protocol (required by Prompt Opinion), `gcloud run deploy --source .` is the correct approach. The deployment infrastructure is identical — managed containers on Cloud Run — but the server wrapper is `to_a2a()` + `uvicorn` rather than ADK's web UI.
 
 ---
 
